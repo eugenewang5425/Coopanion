@@ -13,11 +13,13 @@
  */
 import type { ProviderModule, ProviderInstance } from 'cortico/providers/base.ts';
 import type { LLMProviderEntry, ReasoningTier } from 'cortico/core/types.ts';
+import type { ResponseAssembly } from 'cortico/providers/transport/response-assembly.ts';
 import { isContextOverflow } from 'cortico/providers/transport/errors.ts';
 import { ModelCatalog, ResponsesProvider, type ResponsesProviderOptions } from 'cortico/providers/openai-responses-compat/native.ts';
 import type { GenerateOptions } from 'cortico/core/generation.ts';
 import type { Request } from 'cortico/protocol/open-responses/index.ts';
 import { deepseekPrices } from './pricing.ts';
+import { OllamaStreamFix } from './ollama-stream.ts';
 import { VENDORS, vendorOf, type Effort, type Vendor } from './vendors.ts';
 
 const TIERS = {
@@ -39,8 +41,13 @@ const readsImages = (entry: LLMProviderEntry, model: string | undefined) => !!mo
 
 /** The Responses client with the thinking level rewritten to the value the service takes (`Vendor.effort`). */
 class VendorResponses extends ResponsesProvider {
-  constructor(opts: ResponsesProviderOptions, private readonly effort: Vendor['effort']) {
+  constructor(opts: ResponsesProviderOptions, private readonly effort: Vendor['effort'], private readonly vendorId: string | null) {
     super(opts);
+  }
+
+  /** Ollama's stream shape breaks the strict Responses accumulator; see `ollama-stream.ts`. */
+  protected override responseAssembly(): ResponseAssembly {
+    return this.vendorId === 'ollama' ? new OllamaStreamFix() : super.responseAssembly();
   }
 
   protected override buildResponseBody(request: Request, options: GenerateOptions): Record<string, unknown> {
@@ -80,7 +87,12 @@ export const COO = {
     const vendor = vendorOf(entry.baseUrl);
     return {
       listModels: () => catalog.list(),
-      contextWindow: (model) => vendor?.contextWindows?.[model] ?? catalog.contextWindow(model),
+      // entry.options.contextWindow fills in for services whose model list doesn't report a
+      // context (Ollama's doesn't): without a window the Core sends the whole session history,
+      // which a local model can't prefill inside the first-response budget.
+      contextWindow: (model) => vendor?.contextWindows?.[model]
+        ?? ((current().options ?? {}) as { contextWindow?: number }).contextWindow
+        ?? catalog.contextWindow(model),
       compatibilityKey: () => [vendor?.id ?? 'coo', name],
       client: new VendorResponses({
         baseUrl: entry.baseUrl,
@@ -89,7 +101,11 @@ export const COO = {
         media: { enabled: () => current().multimodal === true && readsImages(current(), current().spec?.model), read: host.readBlob },
         keepThinking: host.keepThinking,
         reasoningReplay: 'plaintext',
-      }, vendor?.effort),
+        // entry.options.extraBody merges last into every request body. E.g. {"stream": false} for
+        // endpoints whose streaming shape fails this client's Responses validator: Ollama before
+        // 0.35 announces the message and a function_call under the same output_index 0.
+        get extraBody() { return ((current().options ?? {}) as { extraBody?: Record<string, unknown> }).extraBody ?? {}; },
+      }, vendor?.effort, vendor?.id ?? null),
     };
   },
 } satisfies ProviderModule;
